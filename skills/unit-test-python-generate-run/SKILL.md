@@ -218,9 +218,37 @@ python scripts/dispatch.py claim \
 
 #### 5b. 并发派发
 
-在同一条回复里，对每个输入 JSON 用 `Agent` 工具启动 `python-test-gen-agent`，提示词模板：
+在同一条回复里，对每个输入 JSON 用 `Agent` 工具启动 `python-test-gen-agent`（`subagent_type: "general-purpose"`）。
 
-> 读取 `{repo_root}/.test/{slug}_input.json`，按其 JSON 内容中定义的任务执行。
+**提示词由三部分拼接：**
+
+1. **Agent 定义**：Read `{repo_root}/agents/python-test-gen-agent.md` 的完整内容
+2. **预加载 references**：Read 以下两个文件，拼接到 prompt 中（避免子 agent 首轮额外 Read 调用）
+   - `{repo_root}/skills/unit-test-python-generate-run/references/test-code-template.md`
+   - `{repo_root}/skills/unit-test-python-generate-run/references/cases-patch-format.md`
+3. **任务数据**：
+
+```
+<agents/python-test-gen-agent.md 内容>
+
+---
+
+<references/test-code-template.md 内容>
+
+---
+
+<references/cases-patch-format.md 内容>
+
+---
+
+请处理以下测试生成任务。输入数据：
+```json
+<{repo_root}/.test/{slug}_input.json 的内容>
+```
+仓库根路径：`{repo_root}`
+```
+
+> 注：`fix-loop-guide.md` 和 `coverage-strategy.md` 仍然按需读取（不是每个 sub-agent 都需要）。
 
 所有子 agent 并发启动（`run_in_background: false`），等待全部完成后进入步骤 6。
 

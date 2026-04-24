@@ -55,6 +55,144 @@ def _load_json(path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 公共 API（供 runner.py 直接调用，无 I/O，纯数据变换）
+# ---------------------------------------------------------------------------
+
+def update_state_data(baseline: dict, run_state: dict, cases_patch: dict,
+                      round_n: int, run_result: dict = None) -> dict:
+    """合并 cases patch 到 run_state，可选从 run_result 同步 case 状态。
+    返回更新后的 run_state（原地修改 + 返回引用）。"""
+    _apply_patch(run_state, baseline, cases_patch, round_n)
+    if run_result:
+        _sync_case_status_from_result(run_state, run_result)
+    # 追加 round entry
+    rounds = run_state.setdefault("rounds", [])
+    idx = next((i for i, r in enumerate(rounds) if r.get("round") == round_n), None)
+    entry = _compute_round_entry(run_state, round_n)
+    if idx is not None:
+        rounds[idx] = entry
+    else:
+        rounds.append(entry)
+    rounds.sort(key=lambda r: r.get("round", 0))
+    return run_state
+
+
+def find_gaps(run_result: dict, baseline: dict, run_state: dict) -> dict:
+    """筛出需要补测的函数。返回 gaps dict（与 cmd_gaps 输出同构）。"""
+    cov_config = baseline.get("coverage_config", {})
+    stmt_thr = cov_config.get("statement_threshold", 90)
+    branch_thr = cov_config.get("branch_threshold", 90)
+    func_thr = cov_config.get("function_threshold", 100)
+    exclude_dirs = cov_config.get("exclude_dirs", [])
+
+    run_cov = run_result.get("coverage", {})
+    run_state_files = run_state.get("files", {})
+
+    gaps = []
+    for src_path, finfo in baseline.get("files", {}).items():
+        if any(src_path.startswith(d.rstrip("/") + "/") or src_path == d
+               for d in exclude_dirs):
+            continue
+
+        file_cov = run_cov.get(src_path)
+        run_state_file = run_state_files.get(src_path, {})
+
+        for func_key, fmeta in finfo.get("functions", {}).items():
+            if fmeta.get("test_optional"):
+                continue
+            run_func = run_state_file.get("functions", {}).get(func_key, {})
+            existing_cases = run_func.get("cases", [])
+            existing_summary = [
+                {"id": c.get("id"), "dimension": c.get("dimension"),
+                 "status": c.get("status", "pending"),
+                 "failure_reason": c.get("failure_reason")}
+                for c in existing_cases
+            ]
+
+            reasons = []
+            missed_lines = []
+            missed_branches = []
+            stmt_rate = None
+            branch_rate = None
+
+            if not existing_cases:
+                reasons.append("no_cases")
+
+            if file_cov is None:
+                if "no_cases" not in reasons:
+                    reasons.append("no_run")
+            else:
+                fcov = file_cov.get("functions", {}).get(func_key)
+                if fcov:
+                    stmt_rate = fcov.get("statement_rate", 100.0)
+                    missed_lines = fcov.get("missed_lines", [])
+                    missed_branches = fcov.get("missed_branches", [])
+
+                    if stmt_rate < stmt_thr and stmt_rate < 100.0:
+                        reasons.append("low_statement")
+
+                    file_br = file_cov.get("branch_rate", 100.0)
+                    branch_rate = file_br
+                    if missed_branches and file_br < branch_thr:
+                        reasons.append("low_branch")
+
+            covered_dims = set()
+            for c in existing_cases:
+                d = c.get("dimension")
+                if d and c.get("status") in ("passed", "fixed_pending_rerun"):
+                    covered_dims.add(d)
+            missing_dims = [d for d in fmeta.get("dimensions", [])
+                            if d not in covered_dims]
+
+            if not reasons and not missing_dims:
+                continue
+
+            suggestions = []
+            if "no_cases" in reasons:
+                suggestions.append("尚未生成任何测试，按 dimensions 全量生成")
+            if missing_dims:
+                suggestions.append(f"补充下列维度的用例：{', '.join(missing_dims)}")
+            if missed_lines:
+                suggestions.append(
+                    f"构造输入以覆盖源文件的未覆盖行：{missed_lines[:10]}"
+                    f"{'...' if len(missed_lines) > 10 else ''}"
+                )
+            if missed_branches:
+                suggestions.append(
+                    f"构造输入以覆盖未覆盖分支（行号, 分支索引）："
+                    f"{missed_branches[:10]}"
+                    f"{'...' if len(missed_branches) > 10 else ''}"
+                )
+            if "no_run" in reasons:
+                suggestions.append("测试可能未被测试框架收集，检查测试文件路径和命名")
+
+            gaps.append({
+                "file": src_path,
+                "function": func_key,
+                "signature": fmeta.get("signature", ""),
+                "line_range": fmeta.get("line_range", []),
+                "dimensions": fmeta.get("dimensions", []),
+                "mocks_needed": fmeta.get("mocks_needed", []),
+                "test_path": finfo.get("test_path", ""),
+                "reasons": reasons or ["incomplete_dimensions"],
+                "statement_rate": stmt_rate,
+                "branch_rate": branch_rate,
+                "missed_lines": missed_lines,
+                "missed_branches": missed_branches,
+                "existing_cases": existing_summary,
+                "missing_dimensions": missing_dims,
+                "suggestions": suggestions,
+            })
+
+    return {
+        "thresholds": {"statement": stmt_thr, "branch": branch_thr, "function": func_thr},
+        "overall_summary": run_result.get("summary", {}).get("coverage", {}),
+        "total_gaps": len(gaps),
+        "gaps": gaps,
+    }
+
+
+# ---------------------------------------------------------------------------
 # update-state: 合并 cases patch 到 run_state
 # ---------------------------------------------------------------------------
 

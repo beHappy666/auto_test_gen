@@ -30,6 +30,10 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+# 从 analyze.py 导入公共 API（同一目录下）
+sys.path.insert(0, str(Path(__file__).parent))
+from analyze import update_state_data, find_gaps, _init_run_state, _write_json_atomic as _write_json_atomic, _load_json
+
 CASE_ID_PATTERN = re.compile(r"#\s*CASE_ID\s*:\s*([A-Za-z0-9_\-]+)")
 
 
@@ -41,13 +45,6 @@ def _md5_file(path: Path) -> str:
     if not path.is_file():
         return ""
     return hashlib.md5(path.read_bytes()).hexdigest()
-
-
-def _write_json_atomic(data, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(output_path)
 
 
 def _run(cmd, cwd=None, env=None, capture=True):
@@ -181,10 +178,12 @@ def _run_python(args, baseline):
     py = sys.executable or "python"
     rc, _, _ = _run([py, "-c", "import pytest"])
     tool_status["pytest"] = rc == 0
-    rc, _, _ = _run([py, "-c", "import pytest_cov"])
-    tool_status["pytest_cov"] = rc == 0
-    rc, _, _ = _run([py, "-c", "import coverage"])
-    tool_status["coverage_json"] = rc == 0
+    want_coverage = not args.no_coverage
+    if want_coverage:
+        rc, _, _ = _run([py, "-c", "import pytest_cov"])
+        tool_status["pytest_cov"] = rc == 0
+        rc, _, _ = _run([py, "-c", "import coverage"])
+        tool_status["coverage_json"] = rc == 0
     rc, _, _ = _run([py, "-c", "import xdist"])
     tool_status["xdist"] = rc == 0
     if not tool_status["xdist"]:
@@ -203,16 +202,43 @@ def _run_python(args, baseline):
         cov_data = tmp / ".coverage"
         cov_json = tmp / "coverage.json"
 
+        # 解析 --only-cases：提前构建 case_id→test_name 映射
+        k_filter = None
+        if args.only_cases:
+            case_ids = [c.strip() for c in args.only_cases.split(",") if c.strip()]
+            only_case_map = _parse_case_id_map(tests_scan_dir)
+            # 反向查找：case_id → test_name
+            reverse_map = {}
+            for (fpath, tname), cid in only_case_map.items():
+                reverse_map.setdefault(cid, set()).add(tname)
+            test_names = set()
+            unresolved = []
+            for cid in case_ids:
+                if cid in reverse_map:
+                    test_names.update(reverse_map[cid])
+                else:
+                    unresolved.append(cid)
+            if unresolved:
+                print(f"警告: --only-cases 中以下 case_id 未找到对应测试函数: {unresolved}",
+                      file=sys.stderr)
+            if test_names:
+                # pytest -k 支持 "or" 连接多个关键词
+                k_filter = " or ".join(sorted(test_names))
+
         cmd = [
             py, "-m", "pytest",
             str(pytest_target),
             f"--junit-xml={junit_xml}",
             "-q", "--no-header", "--tb=short",
         ]
-        if tool_status["xdist"] and not args.no_parallel:
+        if args.last_failed:
+            cmd.append("--lf")
+        if k_filter:
+            cmd.extend(["-k", k_filter])
+        if tool_status["xdist"] and not args.no_parallel and not args.last_failed:
             cmd.extend(["-n", "logical"])
         env = dict(os.environ)
-        if tool_status["pytest_cov"] and tool_status["coverage_json"]:
+        if want_coverage and tool_status["pytest_cov"] and tool_status["coverage_json"]:
             source_dirs = (args.source_dirs or ".").split(",")
             for sd in source_dirs:
                 sd = sd.strip()
@@ -242,7 +268,7 @@ def _run_python(args, baseline):
             "covered_branches": 0, "total_branches": 0,
             "covered_functions": 0, "total_functions": 0,
         }
-        if cov_json.is_file():
+        if want_coverage and cov_json.is_file():
             coverage, coverage_summary = _parse_coverage_json(cov_json, baseline, repo_root)
             coverage, coverage_summary = _apply_scope(
                 coverage, coverage_summary, args.scope_sources
@@ -251,16 +277,120 @@ def _run_python(args, baseline):
         summary = _summarize_tests(tests)
         summary["coverage"] = coverage_summary
 
-    return {
-        "language": "python",
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "return_code": rc,
-        "tool_status": tool_status,
-        "scope_sources": _parse_scope(args.scope_sources),
-        "summary": summary,
-        "tests": tests,
-        "coverage": coverage,
-    }
+        # 构建 run_result dict（后续 update-state / gaps 都需要）
+        run_result = {
+            "language": "python",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "return_code": rc,
+            "tool_status": tool_status,
+            "scope_sources": _parse_scope(args.scope_sources),
+            "summary": summary,
+            "tests": tests,
+            "coverage": coverage,
+        }
+
+        # --- 内嵌 update-state（--cases-patch）---
+        run_state_in_memory = None
+        if args.cases_patch and args.run_state and baseline:
+            cases_patch = _load_json(args.cases_patch)
+            if cases_patch:
+                run_state_path = Path(args.run_state)
+                if run_state_path.is_file():
+                    run_state_in_memory = _load_json(args.run_state)
+                else:
+                    run_state_in_memory = _init_run_state(baseline, Path(args.baseline))
+                update_state_data(baseline, run_state_in_memory, cases_patch, args.round or 1, run_result)
+                _write_json_atomic(run_state_in_memory, run_state_path)
+                print(f"  [auto] update-state 完成 → {args.run_state}", file=sys.stderr)
+
+        # --- 内嵌 gaps（--include-gaps）---
+        gaps_data = None
+        if want_coverage and args.include_gaps and baseline:
+            cov = coverage_summary
+            cov_config = baseline.get("coverage_config", {})
+            stmt_thr = cov_config.get("statement_threshold", 90)
+            branch_thr = cov_config.get("branch_threshold", 90)
+            func_thr = cov_config.get("function_threshold", 100)
+            not_met = (cov["statement_rate"] < stmt_thr
+                       or cov["branch_rate"] < branch_thr
+                       or cov["function_rate"] < func_thr)
+            if not_met:
+                # 复用内存中的 run_state，避免重读文件
+                if run_state_in_memory is None and args.run_state:
+                    run_state_in_memory = _load_json(args.run_state)
+                gaps_data = find_gaps(run_result, baseline, run_state_in_memory or {})
+                run_result["gaps"] = gaps_data
+
+        # --- 增强 stderr：per-function 覆盖率明细 ---
+        if want_coverage and coverage:
+            scope_sources = _parse_scope(args.scope_sources)
+            for src_path, fcov in coverage.items():
+                if scope_sources and src_path not in scope_sources:
+                    continue
+                print(f"\n函数覆盖率 [{src_path}]:", file=sys.stderr)
+                for func_key, func_cov in fcov.get("functions", {}).items():
+                    stmt = func_cov.get("statement_rate", 0)
+                    ml = len(func_cov.get("missed_lines", []))
+                    mark = "✓" if ml == 0 and func_cov.get("covered") else "✗"
+                    print(f"  {func_key}: stmt={stmt}% missed_lines={ml} {mark}",
+                          file=sys.stderr)
+
+        # --- 增强 stderr：gaps 摘要 ---
+        if gaps_data and gaps_data.get("gaps"):
+            print(f"\nGaps ({gaps_data['total_gaps']} functions):", file=sys.stderr)
+            for g in gaps_data["gaps"]:
+                print(f"  {g['function']}: missed_lines={g.get('missed_lines', [])[:8]}"
+                      f" missing_dims={g.get('missing_dimensions', [])}", file=sys.stderr)
+                for s in g.get("suggestions", [])[:2]:
+                    print(f"    → {s}", file=sys.stderr)
+
+        # --- 写精简 summary.json（供 sub-agent Read 做决策，不依赖 stderr）---
+        if want_coverage and coverage:
+            cov_config = (baseline or {}).get("coverage_config", {})
+            stmt_thr = cov_config.get("statement_threshold", 90)
+            branch_thr = cov_config.get("branch_threshold", 90)
+            func_thr = cov_config.get("function_threshold", 100)
+
+            per_function = {}
+            scope_sources = _parse_scope(args.scope_sources)
+            for src_path, fcov in coverage.items():
+                if scope_sources and src_path not in scope_sources:
+                    continue
+                for func_key, func_cov in fcov.get("functions", {}).items():
+                    stmt = func_cov.get("statement_rate", 0)
+                    ml = func_cov.get("missed_lines", [])
+                    mb = func_cov.get("missed_branches", [])
+                    meets = (stmt >= stmt_thr
+                             and fcov.get("branch_rate", 0) >= branch_thr
+                             and (func_cov.get("covered", False)
+                                  or 100.0 >= func_thr))
+                    per_function[func_key] = {
+                        "stmt": stmt,
+                        "branch": fcov.get("branch_rate", 0),
+                        "func_covered": func_cov.get("covered", False),
+                        "missed_lines": ml,
+                        "missed_branches": mb,
+                        "meets_threshold": meets,
+                    }
+
+            summary_json = {
+                "status": "ok" if rc == 0 else ("failed" if summary.get("failed") else "error"),
+                "per_function": per_function,
+                "gaps": [{"function": g["function"],
+                          "missed_lines": g.get("missed_lines", []),
+                          "missing_dimensions": g.get("missing_dimensions", []),
+                          "suggestions": g.get("suggestions", [])}
+                         for g in (gaps_data or {}).get("gaps", [])] if gaps_data else [],
+                "fail_count": summary.get("failed", 0) + summary.get("errors", 0),
+                "pass_count": summary.get("passed", 0),
+                "thresholds": {"statement": stmt_thr, "branch": branch_thr, "function": func_thr},
+            }
+            # 写到 {output}.summary.json
+            output_path = Path(args.output)
+            summary_path = output_path.with_suffix(".summary.json")
+            _write_json_atomic(summary_json, summary_path)
+
+    return run_result
 
 
 def _attach_case_ids_python(tests, case_map, repo_root):
@@ -429,8 +559,23 @@ def main():
                        help="仅在报告里保留这些源文件（逗号分隔的相对路径），"
                             "并按它们重新计算 summary。适合 sub-agent 的 per-file 模式。")
     p_run.add_argument("--baseline", default=None, help="基线路径")
+    p_run.add_argument("--no-coverage", action="store_true", default=False,
+                       help="跳过覆盖率采集，用于 fix 循环只关心 pass/fail 的场景")
     p_run.add_argument("--no-parallel", action="store_true", default=False,
                        help="禁用 pytest-xdist 并行执行（用于 debug）")
+    p_run.add_argument("--last-failed", action="store_true", default=False,
+                       help="只重跑上次失败的测试（透传 pytest --lf）")
+    p_run.add_argument("--only-cases", default=None,
+                       help="只跑指定 case 的测试函数，逗号分隔（如 functional_01,boundary_02）。"
+                            "通过 case_id→test_name 映射转为 pytest -k 表达式")
+    p_run.add_argument("--cases-patch", default=None,
+                       help="cases patch JSON 路径；传入后自动调 update-state 注册+同步")
+    p_run.add_argument("--run-state", default=None,
+                       help="state shard 路径（配合 --cases-patch 使用）")
+    p_run.add_argument("--round", type=int, default=0,
+                       help="当前迭代轮数（配合 --cases-patch 使用）")
+    p_run.add_argument("--include-gaps", action="store_true", default=False,
+                       help="覆盖率未达标时自动调 gaps，结果写入输出的 gaps 字段")
     p_run.add_argument("--output", required=True)
 
     args = parser.parse_args()
